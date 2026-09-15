@@ -1,8 +1,15 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub String);
+
+impl SessionId {
+    pub fn new() -> Self {
+        Self(ulid::Ulid::generate().to_string())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -23,7 +30,7 @@ pub enum SessionStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub session_id: SessionId,
-    pub thread_id: String,
+    pub thread_id: ThreadId,
     pub cwd: PathBuf,
     pub model: String,
     pub effort: String,
@@ -43,20 +50,20 @@ pub struct WorkerRequest {
     pub mode: Mode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkerStatus {
     Done,
     Blocked,
-    Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerResponse {
     pub status: WorkerStatus,
     pub summary: String,
     pub evidence: Vec<String>,
     pub changed_files: Vec<PathBuf>,
-    pub tests: String,
+    pub tests: Vec<String>,
     pub open_questions: Vec<String>,
 }

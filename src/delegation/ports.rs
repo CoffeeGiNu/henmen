@@ -17,4 +17,5 @@ pub trait Worker {
 pub trait WorkerThread {
     fn thread_id(&self) -> &ThreadId;
     fn turn(&mut self, request: &WorkerRequest) -> anyhow::Result<WorkerResponse>;
+    fn shutdown(&mut self) -> anyhow::Result<()>;
 }
