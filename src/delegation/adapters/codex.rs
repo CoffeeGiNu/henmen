@@ -305,7 +305,11 @@ enum TurnStatus {
 #[serde(tag = "type")]
 enum TurnItem {
     #[serde(rename = "agentMessage")]
-    AgentMessage { id: String, text: String },
+    AgentMessage {
+        #[allow(dead_code)]
+        id: String,
+        text: String,
+    },
 
     #[serde(other)]
     Other,
