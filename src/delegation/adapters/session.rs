@@ -15,7 +15,7 @@ impl SessionFiles {
     }
 
     fn path(&self, id: &SessionId) -> PathBuf {
-        self.root.join(format!("{}.json", id.0))
+        self.root.join(format!("{}.json", id.as_str()))
     }
 }
 
@@ -42,7 +42,9 @@ mod tests {
 
     fn sample() -> Session {
         Session {
-            session_id: SessionId("01K5CQXM8N7VZR3TFWJ0HB2YQD".to_string()),
+            session_id: "01K5CQXM8N7VZR3TFWJ0HB2YQD"
+                .parse()
+                .expect("valid session id"),
             thread_id: ThreadId("thread_abc".to_string()),
             cwd: PathBuf::from("/home/coffeeginu/henmen"),
             model: "gpt-5.6-luna".to_string(),

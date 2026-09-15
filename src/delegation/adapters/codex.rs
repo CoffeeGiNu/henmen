@@ -6,7 +6,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
 use crate::delegation::application::{
-    Interrupted, Mode, ThreadId, Usage, WorkerMetrics, WorkerRequest, WorkerResponse,
+    Interrupted, Mode, ThreadId, TokenUsage, WorkerMetrics, WorkerRequest, WorkerResponse,
 };
 use crate::delegation::ports::{Worker, WorkerThread};
 use crate::termination::Termination;
@@ -165,12 +165,30 @@ impl CodexWorker {
             .set_child_process_id(process.child_process_id());
         Ok(process)
     }
+
+    fn shutdown_after_error(
+        &self,
+        mut process: CodexProcess,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        let shutdown_result: anyhow::Result<()> = process.shutdown();
+        self.termination.clear_child_process_id();
+        match shutdown_result {
+            Ok(()) => error,
+            Err(shutdown_error) => {
+                let combined: String = format!(
+                    "{error:#} (additionally, the worker shutdown failed: {shutdown_error:#})"
+                );
+                error.context(combined)
+            }
+        }
+    }
 }
 
 impl Worker for CodexWorker {
     fn start(&self, request: &WorkerRequest) -> anyhow::Result<Box<dyn WorkerThread>> {
         let mut process: CodexProcess = self.spawn_registered()?;
-        let result: serde_json::Value = process.request(
+        let result: serde_json::Value = match process.request(
             "thread/start",
             serde_json::json!({
                 "config": { "features": { "memories": false, "plugins": false } },
@@ -178,14 +196,20 @@ impl Worker for CodexWorker {
                 "sandbox": to_codex_sandbox_mode(request.mode),
                 "approvalPolicy": "never",
             }),
-        )?;
+        ) {
+            Ok(result) => result,
+            Err(error) => return Err(self.shutdown_after_error(process, error)),
+        };
         // NOTE: henmen's session.session_id != thread.sessionId.
-        let thread_id: ThreadId = ThreadId(
-            result["thread"]["id"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("thread/start returned no thread id"))?
-                .to_string(),
-        );
+        let thread_id: ThreadId = match result["thread"]["id"].as_str() {
+            Some(value) => ThreadId(value.to_string()),
+            None => {
+                return Err(self.shutdown_after_error(
+                    process,
+                    anyhow::anyhow!("thread/start returned no thread id"),
+                ));
+            }
+        };
         Ok(Box::new(CodexThread {
             process,
             thread_id,
@@ -201,7 +225,7 @@ impl Worker for CodexWorker {
         request: &WorkerRequest,
     ) -> anyhow::Result<Box<dyn WorkerThread>> {
         let mut process: CodexProcess = self.spawn_registered()?;
-        process.request(
+        match process.request(
             "thread/resume",
             serde_json::json!({
                 "config": { "features": { "memories": false, "plugins": false } },
@@ -210,7 +234,10 @@ impl Worker for CodexWorker {
                 "sandbox": to_codex_sandbox_mode(request.mode),
                 "approvalPolicy": "never",
             }),
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(error) => return Err(self.shutdown_after_error(process, error)),
+        }
         Ok(Box::new(CodexThread {
             process,
             thread_id: thread_id.clone(),
@@ -225,7 +252,7 @@ pub struct CodexThread {
     process: CodexProcess,
     thread_id: ThreadId,
     active_turn_id: Option<String>,
-    usage: Option<Usage>,
+    usage: Option<TokenUsage>,
     termination: Arc<Termination>,
 }
 
@@ -348,7 +375,7 @@ fn sum_tokens(calls: &[&serde_json::Value], field: &str) -> Option<u64> {
     calls.iter().map(|call| call[field].as_u64()).sum()
 }
 
-fn token_usage(notifications: &VecDeque<serde_json::Value>, turn_id: &str) -> Option<Usage> {
+fn token_usage(notifications: &VecDeque<serde_json::Value>, turn_id: &str) -> Option<TokenUsage> {
     let calls: Vec<&serde_json::Value> = notifications
         .iter()
         .filter(|notification| {
@@ -360,7 +387,7 @@ fn token_usage(notifications: &VecDeque<serde_json::Value>, turn_id: &str) -> Op
     if calls.is_empty() {
         return None;
     }
-    Some(Usage {
+    Some(TokenUsage {
         input_tokens: sum_tokens(&calls, "inputTokens"),
         cached_input_tokens: sum_tokens(&calls, "cachedInputTokens"),
         output_tokens: sum_tokens(&calls, "outputTokens"),
@@ -448,7 +475,7 @@ mod tests {
 
         assert_eq!(
             token_usage(&notifications, "turn_1"),
-            Some(Usage {
+            Some(TokenUsage {
                 input_tokens: Some(250),
                 cached_input_tokens: Some(64),
                 output_tokens: Some(50),
@@ -465,7 +492,7 @@ mod tests {
 
         assert_eq!(
             token_usage(&notifications, "turn_2"),
-            Some(Usage {
+            Some(TokenUsage {
                 input_tokens: Some(12_776),
                 cached_input_tokens: Some(12_672),
                 output_tokens: Some(40),

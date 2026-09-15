@@ -7,12 +7,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::delegation::adapters::codex::CodexWorker;
-use crate::delegation::adapters::log::LogFile;
+use crate::delegation::adapters::log::RunLogFile;
 use crate::delegation::adapters::session::SessionFiles;
 use crate::delegation::application::{
     Mode, SessionId, WorkerRequest, WorkerResponse, delegate, resume,
 };
-use crate::delegation::ports::{LogSink, SessionStore, Worker};
+use crate::delegation::ports::{RunLog, SessionStore, Worker};
 use crate::termination::Termination;
 
 #[derive(Parser)]
@@ -39,7 +39,7 @@ enum Command {
     #[command(about = "Run one more turn in an existing thread, keeping its context")]
     Resume {
         #[arg(help = "Session to continue, as printed by an earlier run")]
-        session_id: String,
+        session_id: SessionId,
         #[arg(help = "What the worker should do next")]
         task: String,
         #[command(flatten)]
@@ -102,11 +102,11 @@ fn state_directory() -> anyhow::Result<PathBuf> {
         .join("henmen"))
 }
 
-fn opt_in_log_sink() -> anyhow::Result<Option<LogFile>> {
+fn opt_in_run_log() -> anyhow::Result<Option<RunLogFile>> {
     if std::env::var_os("HENMEN_LOG").as_deref() != Some(std::ffi::OsStr::new("1")) {
         return Ok(None);
     }
-    Ok(Some(LogFile::new(
+    Ok(Some(RunLogFile::new(
         state_directory()?.join("logs").join("runs.jsonl"),
     )))
 }
@@ -146,16 +146,20 @@ fn main() -> anyhow::Result<()> {
 
     let worker: CodexWorker = CodexWorker::new(termination);
     let store: SessionFiles = SessionFiles::new(state_directory()?.join("sessions"));
-    let log: Option<LogFile> = opt_in_log_sink()?;
-    let log: Option<&dyn LogSink> = log.as_ref().map(|sink| sink as &dyn LogSink);
+    let run_log: Option<RunLogFile> = opt_in_run_log()?;
+    let run_log: Option<&dyn RunLog> = run_log
+        .as_ref()
+        .map(|run_log_file| run_log_file as &dyn RunLog);
 
     let (session_id, response): (SessionId, WorkerResponse) = match command_line_interface.command {
-        Command::Delegate { task, options } => run_delegate(&worker, &store, log, task, options)?,
+        Command::Delegate { task, options } => {
+            run_delegate(&worker, &store, run_log, task, options)?
+        }
         Command::Resume {
             session_id,
             task,
             options,
-        } => run_resume(&worker, &store, log, SessionId(session_id), task, options)?,
+        } => run_resume(&worker, &store, run_log, session_id, task, options)?,
     };
 
     let output: CommandOutput = CommandOutput {
@@ -169,17 +173,17 @@ fn main() -> anyhow::Result<()> {
 fn run_delegate(
     worker: &dyn Worker,
     store: &dyn SessionStore,
-    log: Option<&dyn LogSink>,
+    run_log: Option<&dyn RunLog>,
     task: String,
     options: TurnOptions,
 ) -> anyhow::Result<(SessionId, WorkerResponse)> {
-    delegate(worker, store, log, &build_request(task, options)?)
+    delegate(worker, store, run_log, &build_request(task, options)?)
 }
 
 fn run_resume(
     worker: &dyn Worker,
     store: &dyn SessionStore,
-    log: Option<&dyn LogSink>,
+    run_log: Option<&dyn RunLog>,
     session_id: SessionId,
     task: String,
     options: TurnOptions,
@@ -187,7 +191,7 @@ fn run_resume(
     resume(
         worker,
         store,
-        log,
+        run_log,
         &session_id,
         &build_request(task, options)?,
     )

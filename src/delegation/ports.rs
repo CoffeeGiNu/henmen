@@ -1,5 +1,5 @@
 use crate::delegation::application::{
-    LogEntry, Session, SessionId, ThreadId, WorkerMetrics, WorkerRequest, WorkerResponse,
+    RunRecord, Session, SessionId, ThreadId, WorkerMetrics, WorkerRequest, WorkerResponse,
 };
 
 pub trait SessionStore {
@@ -7,8 +7,8 @@ pub trait SessionStore {
     fn load(&self, id: &SessionId) -> anyhow::Result<Session>;
 }
 
-pub trait LogSink {
-    fn append(&self, entry: &LogEntry) -> anyhow::Result<()>;
+pub trait RunLog {
+    fn append(&self, record: &RunRecord) -> anyhow::Result<()>;
 }
 
 pub trait Worker {
