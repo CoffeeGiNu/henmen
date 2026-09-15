@@ -3,8 +3,11 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::Instant;
 
-use crate::delegation::application::{Interrupted, Mode, ThreadId, WorkerRequest, WorkerResponse};
+use crate::delegation::application::{
+    Interrupted, Mode, ThreadId, Usage, WorkerMetrics, WorkerRequest, WorkerResponse,
+};
 use crate::delegation::ports::{Worker, WorkerThread};
 use crate::termination::Termination;
 use std::sync::Arc;
@@ -15,10 +18,12 @@ pub struct CodexProcess {
     stdout: BufReader<ChildStdout>,
     next_request_id: u64,
     pending_notifications: VecDeque<serde_json::Value>,
+    startup_milliseconds: u64,
 }
 
 impl CodexProcess {
     pub fn spawn() -> anyhow::Result<Self> {
+        let started_at: Instant = Instant::now();
         let mut child: Child = Command::new("codex")
             .arg("app-server")
             .stdin(Stdio::piped())
@@ -39,6 +44,7 @@ impl CodexProcess {
             stdout: BufReader::new(stdout),
             next_request_id: 0,
             pending_notifications: VecDeque::new(),
+            startup_milliseconds: 0,
         };
         process.request(
             "initialize",
@@ -49,6 +55,7 @@ impl CodexProcess {
             }),
         )?;
         process.notify("initialized", serde_json::json!({}))?;
+        process.startup_milliseconds = started_at.elapsed().as_millis() as u64;
         Ok(process)
     }
 
@@ -183,6 +190,7 @@ impl Worker for CodexWorker {
             process,
             thread_id,
             active_turn_id: None,
+            usage: None,
             termination: Arc::clone(&self.termination),
         }))
     }
@@ -207,6 +215,7 @@ impl Worker for CodexWorker {
             process,
             thread_id: thread_id.clone(),
             active_turn_id: None,
+            usage: None,
             termination: Arc::clone(&self.termination),
         }))
     }
@@ -216,6 +225,7 @@ pub struct CodexThread {
     process: CodexProcess,
     thread_id: ThreadId,
     active_turn_id: Option<String>,
+    usage: Option<Usage>,
     termination: Arc<Termination>,
 }
 
@@ -232,6 +242,13 @@ impl WorkerThread for CodexThread {
                 error
             }
         })
+    }
+
+    fn metrics(&self) -> WorkerMetrics {
+        WorkerMetrics {
+            usage: self.usage,
+            startup_milliseconds: Some(self.process.startup_milliseconds),
+        }
     }
 
     fn shutdown(&mut self) -> anyhow::Result<()> {
@@ -271,6 +288,7 @@ impl CodexThread {
         self.active_turn_id = None;
 
         let turn: Turn = serde_json::from_value(notification["params"]["turn"].take())?;
+        self.usage = token_usage(&self.process.pending_notifications, &turn.id);
         match turn.status {
             TurnStatus::Completed => parse_worker_response(&turn),
             TurnStatus::Failed => anyhow::bail!(
@@ -324,6 +342,29 @@ fn read_message(reader: &mut impl BufRead) -> anyhow::Result<serde_json::Value> 
         anyhow::bail!("end of stream");
     }
     Ok(serde_json::from_str(&line)?)
+}
+
+fn sum_tokens(calls: &[&serde_json::Value], field: &str) -> Option<u64> {
+    calls.iter().map(|call| call[field].as_u64()).sum()
+}
+
+fn token_usage(notifications: &VecDeque<serde_json::Value>, turn_id: &str) -> Option<Usage> {
+    let calls: Vec<&serde_json::Value> = notifications
+        .iter()
+        .filter(|notification| {
+            notification["method"] == "thread/tokenUsage/updated"
+                && notification["params"]["turnId"] == turn_id
+        })
+        .map(|notification| &notification["params"]["tokenUsage"]["last"])
+        .collect();
+    if calls.is_empty() {
+        return None;
+    }
+    Some(Usage {
+        input_tokens: sum_tokens(&calls, "inputTokens"),
+        cached_input_tokens: sum_tokens(&calls, "cachedInputTokens"),
+        output_tokens: sum_tokens(&calls, "outputTokens"),
+    })
 }
 
 fn to_codex_sandbox_mode(mode: Mode) -> &'static str {
@@ -381,6 +422,63 @@ mod tests {
                 "output_schema is missing required field {field}"
             );
         }
+    }
+
+    fn token_usage_update(turn_id: &str, last: (u64, u64, u64)) -> serde_json::Value {
+        serde_json::json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "turnId": turn_id,
+                "tokenUsage": {"last": {
+                    "inputTokens": last.0,
+                    "cachedInputTokens": last.1,
+                    "outputTokens": last.2
+                }}
+            }
+        })
+    }
+
+    #[test]
+    fn adds_up_every_model_call_of_the_turn() {
+        let notifications: VecDeque<serde_json::Value> = VecDeque::from(vec![
+            serde_json::json!({"method": "turn/started"}),
+            token_usage_update("turn_1", (100, 0, 20)),
+            token_usage_update("turn_1", (150, 64, 30)),
+        ]);
+
+        assert_eq!(
+            token_usage(&notifications, "turn_1"),
+            Some(Usage {
+                input_tokens: Some(250),
+                cached_input_tokens: Some(64),
+                output_tokens: Some(50),
+            })
+        );
+    }
+
+    #[test]
+    fn leaves_out_the_tokens_a_resumed_thread_spent_earlier() {
+        let notifications: VecDeque<serde_json::Value> = VecDeque::from(vec![
+            token_usage_update("turn_1", (12_848, 6_000, 90)),
+            token_usage_update("turn_2", (12_776, 12_672, 40)),
+        ]);
+
+        assert_eq!(
+            token_usage(&notifications, "turn_2"),
+            Some(Usage {
+                input_tokens: Some(12_776),
+                cached_input_tokens: Some(12_672),
+                output_tokens: Some(40),
+            })
+        );
+    }
+
+    #[test]
+    fn reports_no_usage_without_a_notification() {
+        let notifications: VecDeque<serde_json::Value> =
+            VecDeque::from(vec![serde_json::json!({"method": "turn/completed"})]);
+
+        assert_eq!(token_usage(&notifications, "turn_1"), None);
     }
 
     #[test]

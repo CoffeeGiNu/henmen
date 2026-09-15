@@ -1,8 +1,14 @@
-use crate::delegation::application::{Session, SessionId, ThreadId, WorkerRequest, WorkerResponse};
+use crate::delegation::application::{
+    LogEntry, Session, SessionId, ThreadId, WorkerMetrics, WorkerRequest, WorkerResponse,
+};
 
 pub trait SessionStore {
     fn save(&self, session: &Session) -> anyhow::Result<()>;
     fn load(&self, id: &SessionId) -> anyhow::Result<Session>;
+}
+
+pub trait LogSink {
+    fn append(&self, entry: &LogEntry) -> anyhow::Result<()>;
 }
 
 pub trait Worker {
@@ -18,4 +24,7 @@ pub trait WorkerThread {
     fn thread_id(&self) -> &ThreadId;
     fn turn(&mut self, request: &WorkerRequest) -> anyhow::Result<WorkerResponse>;
     fn shutdown(&mut self) -> anyhow::Result<()>;
+    fn metrics(&self) -> WorkerMetrics {
+        WorkerMetrics::default()
+    }
 }
