@@ -38,12 +38,12 @@ impl SessionStore for SessionFiles {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delegation::application::{Mode, SessionStatus};
+    use crate::delegation::application::{Mode, SessionStatus, ThreadId};
 
     fn sample() -> Session {
         Session {
-            session_id: SessionId("1757800000-1234".to_string()),
-            thread_id: "thread_abc".to_string(),
+            session_id: SessionId("01K5CQXM8N7VZR3TFWJ0HB2YQD".to_string()),
+            thread_id: ThreadId("thread_abc".to_string()),
             cwd: PathBuf::from("/home/coffeeginu/henmen"),
             model: "gpt-5.6-luna".to_string(),
             effort: "max".to_string(),
