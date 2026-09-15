@@ -15,7 +15,12 @@ use crate::delegation::ports::{SessionStore, Worker};
 use crate::termination::Termination;
 
 #[derive(Parser)]
-#[command(name = "henmen", version)]
+#[command(
+    name = "henmen",
+    version,
+    about = "Delegate broad code investigation to a worker agent, so the calling agent's context stays small. The worker currently runs on [Codex]",
+    after_long_help = "Each run prints one JSON object on stdout, and nothing else; diagnostics go to stderr.\n\n  {\"session_id\": \"01M2HZ...\",\n   \"response\": {\"status\": \"done\"|\"blocked\",\n                \"summary\": \"...\",\n                \"evidence\": [\"src/retry.rs:120-145\"],\n                \"changed_files\": [],\n                \"tests\": [],\n                \"open_questions\": []}}\n\nPass that session_id to `henmen resume` to continue the same thread. A read-only\nworker that could not do what it was asked reports \"blocked\" rather than failing.\n\nSessions are stored under $XDG_STATE_HOME/henmen/sessions/, or\n~/.local/state/henmen/sessions/ when that is unset."
+)]
 struct CommandLineInterface {
     #[command(subcommand)]
     command: Command,
@@ -23,13 +28,18 @@ struct CommandLineInterface {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(about = "Run one worker turn in a fresh thread")]
     Delegate {
+        #[arg(help = "What the worker should do")]
         task: String,
         #[command(flatten)]
         options: TurnOptions,
     },
+    #[command(about = "Run one more turn in an existing thread, keeping its context")]
     Resume {
+        #[arg(help = "Session to continue, as printed by an earlier run")]
         session_id: String,
+        #[arg(help = "What the worker should do next")]
         task: String,
         #[command(flatten)]
         options: TurnOptions,
@@ -38,13 +48,23 @@ enum Command {
 
 #[derive(clap::Args)]
 struct TurnOptions {
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Model slug for the worker. Which slugs exist is decided by the backend, not by henmen"
+    )]
     model: String,
-    #[arg(long)]
+    #[arg(long, help = "Reasoning effort. Valid values depend on the model")]
     effort: String,
-    #[arg(long, value_enum)]
+    #[arg(
+        long,
+        value_enum,
+        help = "inspect is read-only; edit may write inside --cwd"
+    )]
     mode: CommandLineMode,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Workspace root for the worker (default: the current directory)"
+    )]
     cwd: Option<PathBuf>,
 }
 
@@ -63,6 +83,7 @@ impl From<CommandLineMode> for Mode {
     }
 }
 
+// TODO: expose token usage from thread/tokenUsage/updated? probably behind a debug flag.
 #[derive(serde::Serialize)]
 struct CommandOutput {
     session_id: SessionId,
