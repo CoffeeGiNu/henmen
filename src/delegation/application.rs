@@ -5,6 +5,10 @@ use std::path::PathBuf;
 
 use crate::delegation::ports::{SessionStore, Worker, WorkerThread};
 
+#[derive(Debug, thiserror::Error)]
+#[error("the worker was interrupted")]
+pub struct Interrupted;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub String);
 
@@ -91,6 +95,7 @@ pub fn delegate(
     let result: anyhow::Result<WorkerResponse> = thread.turn(request);
     session.status = match &result {
         Ok(_) => SessionStatus::Completed,
+        Err(error) if error.downcast_ref::<Interrupted>().is_some() => SessionStatus::Interrupted,
         Err(_) => SessionStatus::Failed,
     };
     store.save(&session)?;
@@ -121,6 +126,7 @@ pub fn resume(
     let result: anyhow::Result<WorkerResponse> = thread.turn(request);
     session.status = match &result {
         Ok(_) => SessionStatus::Completed,
+        Err(error) if error.downcast_ref::<Interrupted>().is_some() => SessionStatus::Interrupted,
         Err(_) => SessionStatus::Failed,
     };
     store.save(&session)?;

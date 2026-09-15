@@ -4,8 +4,10 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use crate::delegation::application::{Mode, ThreadId, WorkerRequest, WorkerResponse};
+use crate::delegation::application::{Interrupted, Mode, ThreadId, WorkerRequest, WorkerResponse};
 use crate::delegation::ports::{Worker, WorkerThread};
+use crate::termination::Termination;
+use std::sync::Arc;
 
 pub struct CodexProcess {
     child: Child,
@@ -120,6 +122,10 @@ impl CodexProcess {
         }
     }
 
+    pub fn child_process_id(&self) -> u32 {
+        self.child.id()
+    }
+
     pub fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
@@ -137,11 +143,26 @@ impl Drop for CodexProcess {
     }
 }
 
-pub struct CodexWorker;
+pub struct CodexWorker {
+    termination: Arc<Termination>,
+}
+
+impl CodexWorker {
+    pub fn new(termination: Arc<Termination>) -> Self {
+        Self { termination }
+    }
+
+    fn spawn_registered(&self) -> anyhow::Result<CodexProcess> {
+        let process: CodexProcess = CodexProcess::spawn()?;
+        self.termination
+            .set_child_process_id(process.child_process_id());
+        Ok(process)
+    }
+}
 
 impl Worker for CodexWorker {
     fn start(&self, request: &WorkerRequest) -> anyhow::Result<Box<dyn WorkerThread>> {
-        let mut process: CodexProcess = CodexProcess::spawn()?;
+        let mut process: CodexProcess = self.spawn_registered()?;
         let result: serde_json::Value = process.request(
             "thread/start",
             serde_json::json!({
@@ -161,6 +182,7 @@ impl Worker for CodexWorker {
             process,
             thread_id,
             active_turn_id: None,
+            termination: Arc::clone(&self.termination),
         }))
     }
 
@@ -169,7 +191,7 @@ impl Worker for CodexWorker {
         thread_id: &ThreadId,
         request: &WorkerRequest,
     ) -> anyhow::Result<Box<dyn WorkerThread>> {
-        let mut process: CodexProcess = CodexProcess::spawn()?;
+        let mut process: CodexProcess = self.spawn_registered()?;
         process.request(
             "thread/resume",
             serde_json::json!({
@@ -183,6 +205,7 @@ impl Worker for CodexWorker {
             process,
             thread_id: thread_id.clone(),
             active_turn_id: None,
+            termination: Arc::clone(&self.termination),
         }))
     }
 }
@@ -191,6 +214,7 @@ pub struct CodexThread {
     process: CodexProcess,
     thread_id: ThreadId,
     active_turn_id: Option<String>,
+    termination: Arc<Termination>,
 }
 
 impl WorkerThread for CodexThread {
@@ -199,6 +223,35 @@ impl WorkerThread for CodexThread {
     }
 
     fn turn(&mut self, request: &WorkerRequest) -> anyhow::Result<WorkerResponse> {
+        self.turn_inner(request).map_err(|error| {
+            if self.termination.is_requested() {
+                error.context(Interrupted)
+            } else {
+                error
+            }
+        })
+    }
+
+    fn shutdown(&mut self) -> anyhow::Result<()> {
+        let active_turn_id: Option<String> = self.active_turn_id.take();
+        let interrupt_result: anyhow::Result<()> = match active_turn_id {
+            Some(turn_id) if self.process.is_running() => self
+                .process
+                .request(
+                    "turn/interrupt",
+                    serde_json::json!({ "threadId": self.thread_id.0, "turnId": turn_id }),
+                )
+                .map(|_| ()),
+            _ => Ok(()),
+        };
+        let shutdown_result: anyhow::Result<()> = self.process.shutdown();
+        self.termination.clear_child_process_id();
+        shutdown_result.and(interrupt_result)
+    }
+}
+
+impl CodexThread {
+    fn turn_inner(&mut self, request: &WorkerRequest) -> anyhow::Result<WorkerResponse> {
         let result: serde_json::Value = self.process.request(
             "turn/start",
             serde_json::json!({
@@ -228,22 +281,6 @@ impl WorkerThread for CodexThread {
                 anyhow::bail!("turn {} is still in progress after turn/completed", turn.id)
             }
         }
-    }
-
-    fn shutdown(&mut self) -> anyhow::Result<()> {
-        let active_turn_id: Option<String> = self.active_turn_id.take();
-        let interrupt_result: anyhow::Result<()> = match active_turn_id {
-            Some(turn_id) if self.process.is_running() => self
-                .process
-                .request(
-                    "turn/interrupt",
-                    serde_json::json!({ "threadId": self.thread_id.0, "turnId": turn_id }),
-                )
-                .map(|_| ()),
-            _ => Ok(()),
-        };
-        let shutdown_result: anyhow::Result<()> = self.process.shutdown();
-        shutdown_result.and(interrupt_result)
     }
 }
 
@@ -410,7 +447,7 @@ mod tests {
     #[test]
     #[ignore = "requires a live codex app-server process"]
     fn runs_one_turn_against_real_app_server() -> anyhow::Result<()> {
-        let worker: CodexWorker = CodexWorker;
+        let worker: CodexWorker = CodexWorker::new(Arc::new(Termination::new()));
         let request: WorkerRequest = WorkerRequest {
             task: "Answer from your own knowledge without using any tools: what is 2 + 2?"
                 .to_string(),
