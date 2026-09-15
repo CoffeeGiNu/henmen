@@ -94,10 +94,11 @@ pub fn delegate(
         Err(_) => SessionStatus::Failed,
     };
     store.save(&session)?;
-    thread.shutdown()?;
 
+    let shutdown_result: anyhow::Result<()> = thread.shutdown();
     let response: WorkerResponse =
         result.with_context(|| format!("session: {} failed", session.session_id.0))?;
+    shutdown_result?;
     Ok((session.session_id, response))
 }
 
@@ -123,9 +124,10 @@ pub fn resume(
         Err(_) => SessionStatus::Failed,
     };
     store.save(&session)?;
-    thread.shutdown()?;
 
+    let shutdown_result: anyhow::Result<()> = thread.shutdown();
     let response: WorkerResponse =
         result.with_context(|| format!("session: {} failed", session.session_id.0))?;
+    shutdown_result?;
     Ok((session.session_id, response))
 }

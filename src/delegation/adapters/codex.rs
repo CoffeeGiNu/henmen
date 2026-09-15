@@ -1,4 +1,3 @@
-use anyhow::Ok;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -121,6 +120,10 @@ impl CodexProcess {
         }
     }
 
+    pub fn is_running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
     pub fn shutdown(&mut self) -> anyhow::Result<()> {
         self.stdin.take();
         self.child.wait()?;
@@ -228,13 +231,19 @@ impl WorkerThread for CodexThread {
     }
 
     fn shutdown(&mut self) -> anyhow::Result<()> {
-        if let Some(turn_id) = self.active_turn_id.take() {
-            self.process.request(
-                "turn/interrupt",
-                serde_json::json!({ "threadId": self.thread_id.0, "turnId": turn_id }),
-            )?;
-        }
-        self.process.shutdown()
+        let active_turn_id: Option<String> = self.active_turn_id.take();
+        let interrupt_result: anyhow::Result<()> = match active_turn_id {
+            Some(turn_id) if self.process.is_running() => self
+                .process
+                .request(
+                    "turn/interrupt",
+                    serde_json::json!({ "threadId": self.thread_id.0, "turnId": turn_id }),
+                )
+                .map(|_| ()),
+            _ => Ok(()),
+        };
+        let shutdown_result: anyhow::Result<()> = self.process.shutdown();
+        shutdown_result.and(interrupt_result)
     }
 }
 
