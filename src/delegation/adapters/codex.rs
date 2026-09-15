@@ -166,6 +166,7 @@ impl Worker for CodexWorker {
         let result: serde_json::Value = process.request(
             "thread/start",
             serde_json::json!({
+                "config": { "features": { "memories": false, "plugins": false } },
                 "cwd": request.cwd,
                 "sandbox": to_codex_sandbox_mode(request.mode),
                 "approvalPolicy": "never",
@@ -195,6 +196,7 @@ impl Worker for CodexWorker {
         process.request(
             "thread/resume",
             serde_json::json!({
+                "config": { "features": { "memories": false, "plugins": false } },
                 "threadId": thread_id.0,
                 "cwd": request.cwd,
                 "sandbox": to_codex_sandbox_mode(request.mode),
