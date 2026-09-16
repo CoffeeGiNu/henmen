@@ -316,6 +316,7 @@ impl CodexThread {
 
         let turn: Turn = serde_json::from_value(notification["params"]["turn"].take())?;
         self.usage = token_usage(&self.process.pending_notifications, &turn.id);
+
         match turn.status {
             TurnStatus::Completed => parse_worker_response(&turn),
             TurnStatus::Failed => anyhow::bail!(
@@ -371,26 +372,28 @@ fn read_message(reader: &mut impl BufRead) -> anyhow::Result<serde_json::Value> 
     Ok(serde_json::from_str(&line)?)
 }
 
-fn sum_tokens(calls: &[&serde_json::Value], field: &str) -> Option<u64> {
-    calls.iter().map(|call| call[field].as_u64()).sum()
+fn token_delta(first: &serde_json::Value, last: &serde_json::Value, field: &str) -> Option<u64> {
+    let first_total: u64 = first["tokenUsage"]["total"][field].as_u64()?;
+    let first_last: u64 = first["tokenUsage"]["last"][field].as_u64()?;
+    let last_total: u64 = last["tokenUsage"]["total"][field].as_u64()?;
+    let baseline: u64 = first_total.checked_sub(first_last)?;
+    last_total.checked_sub(baseline)
 }
 
 fn token_usage(notifications: &VecDeque<serde_json::Value>, turn_id: &str) -> Option<TokenUsage> {
-    let calls: Vec<&serde_json::Value> = notifications
+    let mut updates = notifications
         .iter()
         .filter(|notification| {
             notification["method"] == "thread/tokenUsage/updated"
                 && notification["params"]["turnId"] == turn_id
         })
-        .map(|notification| &notification["params"]["tokenUsage"]["last"])
-        .collect();
-    if calls.is_empty() {
-        return None;
-    }
+        .map(|notification| &notification["params"]);
+    let first: &serde_json::Value = updates.next()?;
+    let last: &serde_json::Value = updates.next_back().unwrap_or(first);
     Some(TokenUsage {
-        input_tokens: sum_tokens(&calls, "inputTokens"),
-        cached_input_tokens: sum_tokens(&calls, "cachedInputTokens"),
-        output_tokens: sum_tokens(&calls, "outputTokens"),
+        input_tokens: token_delta(first, last, "inputTokens"),
+        cached_input_tokens: token_delta(first, last, "cachedInputTokens"),
+        output_tokens: token_delta(first, last, "outputTokens"),
     })
 }
 
@@ -451,26 +454,37 @@ mod tests {
         }
     }
 
-    fn token_usage_update(turn_id: &str, last: (u64, u64, u64)) -> serde_json::Value {
+    fn token_usage_update(
+        turn_id: &str,
+        last: (u64, u64, u64),
+        total: (u64, u64, u64),
+    ) -> serde_json::Value {
         serde_json::json!({
             "method": "thread/tokenUsage/updated",
             "params": {
                 "turnId": turn_id,
-                "tokenUsage": {"last": {
-                    "inputTokens": last.0,
-                    "cachedInputTokens": last.1,
-                    "outputTokens": last.2
-                }}
+                "tokenUsage": {
+                    "last": {
+                        "inputTokens": last.0,
+                        "cachedInputTokens": last.1,
+                        "outputTokens": last.2
+                    },
+                    "total": {
+                        "inputTokens": total.0,
+                        "cachedInputTokens": total.1,
+                        "outputTokens": total.2
+                    }
+                }
             }
         })
     }
 
     #[test]
-    fn adds_up_every_model_call_of_the_turn() {
+    fn counts_a_turn_as_the_growth_of_the_running_total() {
         let notifications: VecDeque<serde_json::Value> = VecDeque::from(vec![
             serde_json::json!({"method": "turn/started"}),
-            token_usage_update("turn_1", (100, 0, 20)),
-            token_usage_update("turn_1", (150, 64, 30)),
+            token_usage_update("turn_1", (100, 0, 20), (100, 0, 20)),
+            token_usage_update("turn_1", (150, 64, 30), (250, 64, 50)),
         ]);
 
         assert_eq!(
@@ -486,8 +500,8 @@ mod tests {
     #[test]
     fn leaves_out_the_tokens_a_resumed_thread_spent_earlier() {
         let notifications: VecDeque<serde_json::Value> = VecDeque::from(vec![
-            token_usage_update("turn_1", (12_848, 6_000, 90)),
-            token_usage_update("turn_2", (12_776, 12_672, 40)),
+            token_usage_update("turn_1", (12_848, 6_000, 90), (12_848, 6_000, 90)),
+            token_usage_update("turn_2", (12_776, 12_672, 40), (25_624, 18_672, 130)),
         ]);
 
         assert_eq!(
@@ -496,6 +510,40 @@ mod tests {
                 input_tokens: Some(12_776),
                 cached_input_tokens: Some(12_672),
                 output_tokens: Some(40),
+            })
+        );
+    }
+
+    #[test]
+    fn ignores_a_re_emitted_update_that_did_not_move_the_total() {
+        let notifications: VecDeque<serde_json::Value> = VecDeque::from(vec![
+            token_usage_update("turn_1", (100, 0, 20), (100, 0, 20)),
+            token_usage_update("turn_1", (100, 0, 20), (100, 0, 20)),
+        ]);
+
+        assert_eq!(
+            token_usage(&notifications, "turn_1"),
+            Some(TokenUsage {
+                input_tokens: Some(100),
+                cached_input_tokens: Some(0),
+                output_tokens: Some(20),
+            })
+        );
+    }
+
+    #[test]
+    fn reports_nothing_when_the_running_total_went_backwards() {
+        let notifications: VecDeque<serde_json::Value> = VecDeque::from(vec![
+            token_usage_update("turn_1", (100, 64, 20), (1_100, 1_064, 120)),
+            token_usage_update("turn_1", (150, 64, 30), (900, 900, 90)),
+        ]);
+
+        assert_eq!(
+            token_usage(&notifications, "turn_1"),
+            Some(TokenUsage {
+                input_tokens: None,
+                cached_input_tokens: None,
+                output_tokens: None,
             })
         );
     }
