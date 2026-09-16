@@ -11,8 +11,8 @@ cargo install --path .
 ## usage
 
 ```bash
-henmen delegate <TASK> --model <MODEL> --effort <EFFORT> --mode <inspect|edit> [--cwd <PATH>]
-henmen resume <SESSION_ID> <TASK> --model <MODEL> --effort <EFFORT> --mode <inspect|edit> [--cwd <PATH>]
+henmen delegate <TASK> --model <MODEL> --effort <EFFORT> --mode <inspect|edit> [--cwd <PATH>] [--timeout-minutes <MINUTES>]
+henmen resume <SESSION_ID> <TASK> --model <MODEL> --effort <EFFORT> --mode <inspect|edit> [--cwd <PATH>] [--timeout-minutes <MINUTES>]
 ```
 
 ## License

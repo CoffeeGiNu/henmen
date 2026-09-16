@@ -5,12 +5,13 @@ mod termination;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::delegation::adapters::codex::CodexWorker;
 use crate::delegation::adapters::log::RunLogFile;
 use crate::delegation::adapters::session::SessionFiles;
 use crate::delegation::application::{
-    Mode, SessionId, WorkerRequest, WorkerResponse, delegate, resume,
+    Mode, SessionId, TimedOut, WorkerRequest, WorkerResponse, delegate, resume,
 };
 use crate::delegation::ports::{RunLog, SessionStore, Worker};
 use crate::termination::Termination;
@@ -67,6 +68,12 @@ struct TurnOptions {
         help = "Workspace root for the worker (default: the current directory)"
     )]
     cwd: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value_t = 30,
+        help = "Hard deadline for one worker execution, in minutes"
+    )]
+    timeout_minutes: u64,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -116,12 +123,14 @@ fn build_request(task: String, options: TurnOptions) -> anyhow::Result<WorkerReq
         Some(path) => std::fs::canonicalize(path)?,
         None => std::env::current_dir()?,
     };
+    let timeout: Duration = Duration::from_secs(options.timeout_minutes * 60);
     Ok(WorkerRequest {
         task,
         cwd,
         model: options.model,
         effort: options.effort,
         mode: options.mode.into(),
+        timeout,
     })
 }
 
@@ -151,15 +160,26 @@ fn main() -> anyhow::Result<()> {
         .as_ref()
         .map(|run_log_file| run_log_file as &dyn RunLog);
 
-    let (session_id, response): (SessionId, WorkerResponse) = match command_line_interface.command {
-        Command::Delegate { task, options } => {
-            run_delegate(&worker, &store, run_log, task, options)?
+    let turn_result: anyhow::Result<(SessionId, WorkerResponse)> =
+        match command_line_interface.command {
+            Command::Delegate { task, options } => {
+                run_delegate(&worker, &store, run_log, task, options)
+            }
+            Command::Resume {
+                session_id,
+                task,
+                options,
+            } => run_resume(&worker, &store, run_log, session_id, task, options),
+        };
+    let (session_id, response): (SessionId, WorkerResponse) = match turn_result {
+        Ok(value) => value,
+        Err(error) => {
+            if error.downcast_ref::<TimedOut>().is_some() {
+                eprintln!("{error:#}");
+                std::process::exit(124);
+            }
+            return Err(error);
         }
-        Command::Resume {
-            session_id,
-            task,
-            options,
-        } => run_resume(&worker, &store, run_log, session_id, task, options)?,
     };
 
     let output: CommandOutput = CommandOutput {

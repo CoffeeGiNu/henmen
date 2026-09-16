@@ -3,22 +3,43 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::time::{Duration, Instant};
 
 use crate::delegation::application::{
-    Interrupted, Mode, ThreadId, TokenUsage, WorkerMetrics, WorkerRequest, WorkerResponse,
+    Interrupted, Mode, RateLimitObservation, RateLimitWindow, ThreadId, TimedOut, TokenUsage,
+    WorkerMetrics, WorkerRequest, WorkerResponse,
 };
 use crate::delegation::ports::{Worker, WorkerThread};
 use crate::termination::Termination;
-use std::sync::Arc;
 
 pub struct CodexProcess {
     child: Child,
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    incoming: Receiver<String>,
     next_request_id: u64,
     pending_notifications: VecDeque<serde_json::Value>,
     startup_milliseconds: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Deadline {
+    instant: Instant,
+    timeout: Duration,
+}
+
+impl Deadline {
+    fn after(timeout: Duration) -> Self {
+        Self {
+            instant: Instant::now() + timeout,
+            timeout,
+        }
+    }
+
+    fn remaining(&self) -> Option<Duration> {
+        self.instant.checked_duration_since(Instant::now())
+    }
 }
 
 impl CodexProcess {
@@ -38,10 +59,23 @@ impl CodexProcess {
             .stdout
             .take()
             .ok_or_else(|| anyhow::anyhow!("codex app server did not expose stdout"))?;
+        let (sender, receiver): (Sender<String>, Receiver<String>) = channel();
+        std::thread::spawn(move || {
+            let reader: BufReader<ChildStdout> = BufReader::new(stdout);
+            for line_result in reader.lines() {
+                let line: String = match line_result {
+                    Ok(line) => line,
+                    Err(_) => break,
+                };
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
         let mut process: Self = Self {
             child,
             stdin: Some(stdin),
-            stdout: BufReader::new(stdout),
+            incoming: receiver,
             next_request_id: 0,
             pending_notifications: VecDeque::new(),
             startup_milliseconds: 0,
@@ -53,6 +87,7 @@ impl CodexProcess {
                     "name":"henmen", "version": env!("CARGO_PKG_VERSION")
                 }
             }),
+            None,
         )?;
         process.notify("initialized", serde_json::json!({}))?;
         process.startup_milliseconds = started_at.elapsed().as_millis() as u64;
@@ -63,6 +98,7 @@ impl CodexProcess {
         &mut self,
         method: &str,
         params: serde_json::Value,
+        deadline: Option<Deadline>,
     ) -> anyhow::Result<serde_json::Value> {
         let request_id: u64 = self.next_request_id;
         self.next_request_id += 1;
@@ -80,7 +116,8 @@ impl CodexProcess {
         stdin.flush()?;
 
         loop {
-            let mut incoming_message: serde_json::Value = read_message(&mut self.stdout)?;
+            let mut incoming_message: serde_json::Value =
+                receive_message(&self.incoming, deadline)?;
             if incoming_message["id"] != request_id {
                 self.pending_notifications.push_back(incoming_message);
                 continue;
@@ -107,7 +144,11 @@ impl CodexProcess {
         Ok(())
     }
 
-    pub fn wait_for_notification(&mut self, method: &str) -> anyhow::Result<serde_json::Value> {
+    pub fn wait_for_notification(
+        &mut self,
+        method: &str,
+        deadline: Option<Deadline>,
+    ) -> anyhow::Result<serde_json::Value> {
         let position: Option<usize> = self
             .pending_notifications
             .iter()
@@ -121,12 +162,22 @@ impl CodexProcess {
         }
 
         loop {
-            let incoming_message: serde_json::Value = read_message(&mut self.stdout)?;
+            let incoming_message: serde_json::Value = receive_message(&self.incoming, deadline)?;
             if incoming_message["method"] == method {
                 return Ok(incoming_message);
             }
             self.pending_notifications.push_back(incoming_message);
         }
+    }
+
+    fn read_rate_limit_observation(&mut self) -> Option<RateLimitObservation> {
+        self.request(
+            "account/rateLimits/read",
+            serde_json::json!({}),
+            Some(Deadline::after(Duration::from_secs(10))),
+        )
+        .ok()
+        .and_then(|result: serde_json::Value| parse_rate_limit_observation(&result))
     }
 
     pub fn child_process_id(&self) -> u32 {
@@ -139,6 +190,19 @@ impl CodexProcess {
 
     pub fn shutdown(&mut self) -> anyhow::Result<()> {
         self.stdin.take();
+        let deadline: Deadline = Deadline::after(Duration::from_secs(10));
+        loop {
+            match self.child.try_wait()? {
+                Some(_) => return Ok(()),
+                None => {
+                    if deadline.remaining().is_none() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        self.child.kill()?;
         self.child.wait()?;
         Ok(())
     }
@@ -196,6 +260,7 @@ impl Worker for CodexWorker {
                 "sandbox": to_codex_sandbox_mode(request.mode),
                 "approvalPolicy": "never",
             }),
+            None,
         ) {
             Ok(result) => result,
             Err(error) => return Err(self.shutdown_after_error(process, error)),
@@ -215,6 +280,8 @@ impl Worker for CodexWorker {
             thread_id,
             active_turn_id: None,
             usage: None,
+            rate_limit_before: None,
+            rate_limit_after: None,
             termination: Arc::clone(&self.termination),
         }))
     }
@@ -234,6 +301,7 @@ impl Worker for CodexWorker {
                 "sandbox": to_codex_sandbox_mode(request.mode),
                 "approvalPolicy": "never",
             }),
+            None,
         ) {
             Ok(_) => {}
             Err(error) => return Err(self.shutdown_after_error(process, error)),
@@ -243,6 +311,8 @@ impl Worker for CodexWorker {
             thread_id: thread_id.clone(),
             active_turn_id: None,
             usage: None,
+            rate_limit_before: None,
+            rate_limit_after: None,
             termination: Arc::clone(&self.termination),
         }))
     }
@@ -253,6 +323,8 @@ pub struct CodexThread {
     thread_id: ThreadId,
     active_turn_id: Option<String>,
     usage: Option<TokenUsage>,
+    rate_limit_before: Option<RateLimitObservation>,
+    rate_limit_after: Option<RateLimitObservation>,
     termination: Arc<Termination>,
 }
 
@@ -275,6 +347,8 @@ impl WorkerThread for CodexThread {
         WorkerMetrics {
             usage: self.usage,
             startup_milliseconds: Some(self.process.startup_milliseconds),
+            rate_limit_before: self.rate_limit_before.clone(),
+            rate_limit_after: self.rate_limit_after.clone(),
         }
     }
 
@@ -286,6 +360,7 @@ impl WorkerThread for CodexThread {
                 .request(
                     "turn/interrupt",
                     serde_json::json!({ "threadId": self.thread_id.0, "turnId": turn_id }),
+                    Some(Deadline::after(Duration::from_secs(10))),
                 )
                 .map(|_| ()),
             _ => Ok(()),
@@ -298,6 +373,8 @@ impl WorkerThread for CodexThread {
 
 impl CodexThread {
     fn turn_inner(&mut self, request: &WorkerRequest) -> anyhow::Result<WorkerResponse> {
+        let deadline: Deadline = Deadline::after(request.timeout);
+        self.rate_limit_before = self.process.read_rate_limit_observation();
         let result: serde_json::Value = self.process.request(
             "turn/start",
             serde_json::json!({
@@ -307,11 +384,14 @@ impl CodexThread {
                 "effort": request.effort,
                 "outputSchema": output_schema(),
             }),
+            Some(deadline),
         )?;
         self.active_turn_id = result["turn"]["id"].as_str().map(str::to_string);
 
-        let mut notification: serde_json::Value =
-            self.process.wait_for_notification("turn/completed")?;
+        let mut notification: serde_json::Value = self
+            .process
+            .wait_for_notification("turn/completed", Some(deadline))?;
+        self.rate_limit_after = self.process.read_rate_limit_observation();
         self.active_turn_id = None;
 
         let turn: Turn = serde_json::from_value(notification["params"]["turn"].take())?;
@@ -363,13 +443,63 @@ enum TurnItem {
     Other,
 }
 
-fn read_message(reader: &mut impl BufRead) -> anyhow::Result<serde_json::Value> {
-    let mut line: String = String::new();
-    let read_bytes: usize = reader.read_line(&mut line)?;
-    if read_bytes == 0 {
-        anyhow::bail!("end of stream");
-    }
+fn receive_message(
+    incoming: &Receiver<String>,
+    deadline: Option<Deadline>,
+) -> anyhow::Result<serde_json::Value> {
+    let line: String = match deadline {
+        None => incoming
+            .recv()
+            .map_err(|_| anyhow::anyhow!("end of stream"))?,
+        Some(deadline) => {
+            let remaining: Duration = deadline.remaining().ok_or_else(|| {
+                anyhow::Error::new(TimedOut {
+                    timeout: deadline.timeout,
+                })
+            })?;
+            incoming
+                .recv_timeout(remaining)
+                .map_err(|error: RecvTimeoutError| match error {
+                    RecvTimeoutError::Timeout => anyhow::Error::new(TimedOut {
+                        timeout: deadline.timeout,
+                    }),
+                    RecvTimeoutError::Disconnected => anyhow::anyhow!("end of stream"),
+                })?
+        }
+    };
     Ok(serde_json::from_str(&line)?)
+}
+
+fn parse_rate_limit_observation(result: &serde_json::Value) -> Option<RateLimitObservation> {
+    let rate_limits: &serde_json::Map<String, serde_json::Value> =
+        result.get("rateLimits")?.as_object()?;
+    let limit_id: Option<String> = rate_limits
+        .get("limitId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let primary: Option<RateLimitWindow> =
+        rate_limits.get("primary").and_then(parse_rate_limit_window);
+    let secondary: Option<RateLimitWindow> = rate_limits
+        .get("secondary")
+        .and_then(parse_rate_limit_window);
+    Some(RateLimitObservation {
+        limit_id,
+        primary,
+        secondary,
+    })
+}
+
+fn parse_rate_limit_window(value: &serde_json::Value) -> Option<RateLimitWindow> {
+    let window: &serde_json::Map<String, serde_json::Value> = value.as_object()?;
+    let used_percent: f64 = window.get("usedPercent")?.as_f64()?;
+    let window_duration_minutes: Option<u64> =
+        window.get("windowDurationMins").and_then(Value::as_u64);
+    let resets_at: Option<i64> = window.get("resetsAt").and_then(Value::as_i64);
+    Some(RateLimitWindow {
+        used_percent,
+        window_duration_minutes,
+        resets_at,
+    })
 }
 
 fn token_delta(first: &serde_json::Value, last: &serde_json::Value, field: &str) -> Option<u64> {
@@ -381,15 +511,16 @@ fn token_delta(first: &serde_json::Value, last: &serde_json::Value, field: &str)
 }
 
 fn token_usage(notifications: &VecDeque<serde_json::Value>, turn_id: &str) -> Option<TokenUsage> {
-    let mut updates = notifications
+    let updates: Vec<&serde_json::Value> = notifications
         .iter()
         .filter(|notification| {
             notification["method"] == "thread/tokenUsage/updated"
                 && notification["params"]["turnId"] == turn_id
         })
-        .map(|notification| &notification["params"]);
-    let first: &serde_json::Value = updates.next()?;
-    let last: &serde_json::Value = updates.next_back().unwrap_or(first);
+        .map(|notification| &notification["params"])
+        .collect();
+    let first: &serde_json::Value = updates.first().copied()?;
+    let last: &serde_json::Value = updates.last().copied().unwrap_or(first);
     Some(TokenUsage {
         input_tokens: token_delta(first, last, "inputTokens"),
         cached_input_tokens: token_delta(first, last, "cachedInputTokens"),
@@ -452,6 +583,62 @@ mod tests {
                 "output_schema is missing required field {field}"
             );
         }
+    }
+
+    #[test]
+    fn parses_rate_limit_observation_with_both_windows() {
+        let result: serde_json::Value = serde_json::json!({
+            "rateLimits": {
+                "limitId": "codex",
+                "limitName": "Codex account",
+                "primary": {
+                    "usedPercent": 12,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1789519477
+                },
+                "secondary": {
+                    "usedPercent": 40,
+                    "windowDurationMins": 10080,
+                    "resetsAt": 1789519477
+                }
+            },
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "ignored": true
+                }
+            },
+            "credits": {
+                "ignored": true
+            }
+        });
+        let observation: Option<RateLimitObservation> = parse_rate_limit_observation(&result);
+
+        assert_eq!(
+            observation,
+            Some(RateLimitObservation {
+                limit_id: Some("codex".to_string()),
+                primary: Some(RateLimitWindow {
+                    used_percent: 12.0,
+                    window_duration_minutes: Some(300),
+                    resets_at: Some(1789519477),
+                }),
+                secondary: Some(RateLimitWindow {
+                    used_percent: 40.0,
+                    window_duration_minutes: Some(10080),
+                    resets_at: Some(1789519477),
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn returns_none_without_rate_limits() {
+        let result: serde_json::Value = serde_json::json!({
+            "rateLimitsByLimitId": {},
+            "credits": {}
+        });
+
+        assert_eq!(parse_rate_limit_observation(&result), None);
     }
 
     fn token_usage_update(
@@ -557,19 +744,39 @@ mod tests {
     }
 
     #[test]
-    fn reads_one_frame_per_line() -> anyhow::Result<()> {
-        let mut input: &[u8] = b"{\"id\":1,\"result\":{}}\n{\"method\":\"turn/completed\"}\n";
+    fn receives_two_frames_in_order() -> anyhow::Result<()> {
+        let (sender, incoming): (Sender<String>, Receiver<String>) = channel();
+        sender.send(r#"{"id":1,"result":{}}"#.to_string())?;
+        sender.send(r#"{"method":"turn/completed"}"#.to_string())?;
 
-        assert_eq!(read_message(&mut input)?["id"], 1);
-        assert_eq!(read_message(&mut input)?["method"], "turn/completed");
+        let first_message: serde_json::Value = receive_message(&incoming, None)?;
+        let second_message: serde_json::Value = receive_message(&incoming, None)?;
+
+        assert_eq!(first_message["id"], 1);
+        assert_eq!(second_message["method"], "turn/completed");
         Ok(())
     }
 
     #[test]
-    fn rejects_end_of_stream() {
-        let mut input: &[u8] = b"";
+    fn times_out_when_no_frame_arrives() {
+        let (_sender, incoming): (Sender<String>, Receiver<String>) = channel();
+        let deadline: Deadline = Deadline::after(Duration::from_millis(50));
 
-        assert!(read_message(&mut input).is_err());
+        let error: anyhow::Error = receive_message(&incoming, Some(deadline))
+            .expect_err("receive_message should time out");
+
+        assert!(error.downcast_ref::<TimedOut>().is_some());
+    }
+
+    #[test]
+    fn rejects_a_dropped_sender() {
+        let (sender, incoming): (Sender<String>, Receiver<String>) = channel();
+        drop(sender);
+
+        let error: anyhow::Error =
+            receive_message(&incoming, None).expect_err("receive_message should reject EOF");
+
+        assert_eq!(error.to_string(), "end of stream");
     }
 
     #[test]
@@ -634,6 +841,7 @@ mod tests {
             model: "gpt-5.6-luna".to_string(),
             effort: "low".to_string(),
             mode: Mode::Inspect,
+            timeout: Duration::from_secs(30 * 60),
         };
 
         let mut thread: Box<dyn WorkerThread> = worker.start(&request)?;
@@ -652,7 +860,8 @@ mod tests {
     fn completes_handshake_against_real_app_server() -> anyhow::Result<()> {
         let mut process: CodexProcess = CodexProcess::spawn()?;
 
-        let result: serde_json::Value = process.request("model/list", serde_json::json!({}))?;
+        let result: serde_json::Value =
+            process.request("model/list", serde_json::json!({}), None)?;
 
         assert!(result.is_object());
 

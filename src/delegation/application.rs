@@ -3,13 +3,19 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::delegation::ports::{RunLog, SessionStore, Worker, WorkerThread};
 
 #[derive(Debug, thiserror::Error)]
 #[error("the worker was interrupted")]
 pub struct Interrupted;
+
+#[derive(Debug, thiserror::Error)]
+#[error("the worker did not finish within {} seconds", timeout.as_secs())]
+pub struct TimedOut {
+    pub timeout: Duration,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -62,12 +68,13 @@ pub enum Mode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     Running,
     Completed,
     Failed,
     Interrupted,
+    TimedOut,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -91,6 +98,7 @@ pub struct WorkerRequest {
     pub model: String,
     pub effort: String,
     pub mode: Mode,
+    pub timeout: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -125,10 +133,26 @@ pub struct TokenUsage {
     pub output_tokens: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitWindow {
+    pub used_percent: f64,
+    pub window_duration_minutes: Option<u64>,
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitObservation {
+    pub limit_id: Option<String>,
+    pub primary: Option<RateLimitWindow>,
+    pub secondary: Option<RateLimitWindow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct WorkerMetrics {
     pub usage: Option<TokenUsage>,
     pub startup_milliseconds: Option<u64>,
+    pub rate_limit_before: Option<RateLimitObservation>,
+    pub rate_limit_after: Option<RateLimitObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -146,6 +170,10 @@ pub struct RunRecord {
     pub worker_status: Option<WorkerStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_before: Option<RateLimitObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit_after: Option<RateLimitObservation>,
     #[serde(rename = "worker_startup_ms", skip_serializing_if = "Option::is_none")]
     pub worker_startup_milliseconds: Option<u64>,
 }
@@ -179,6 +207,8 @@ fn write_run_record(
         session_status: session.status,
         worker_status,
         usage: metrics.usage,
+        rate_limit_before: metrics.rate_limit_before.clone(),
+        rate_limit_after: metrics.rate_limit_after.clone(),
         worker_startup_milliseconds: metrics.startup_milliseconds,
     };
     if let Err(error) = run_log.append(&record) {
@@ -200,6 +230,7 @@ fn run_turn(
     let result: anyhow::Result<WorkerResponse> = thread.turn(request);
     session.status = match &result {
         Ok(_) => SessionStatus::Completed,
+        Err(error) if error.downcast_ref::<TimedOut>().is_some() => SessionStatus::TimedOut,
         Err(error) if error.downcast_ref::<Interrupted>().is_some() => SessionStatus::Interrupted,
         Err(_) => SessionStatus::Failed,
     };
@@ -300,7 +331,7 @@ pub fn resume(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
     use std::rc::Rc;
 
@@ -314,6 +345,7 @@ mod tests {
     struct FakeSessionStore {
         save_failure: SaveFailure,
         save_count: Cell<usize>,
+        saved_statuses: RefCell<Vec<SessionStatus>>,
         loaded_session: Session,
     }
 
@@ -322,15 +354,17 @@ mod tests {
             Self {
                 save_failure,
                 save_count: Cell::new(0),
+                saved_statuses: RefCell::new(Vec::new()),
                 loaded_session: fake_session(),
             }
         }
     }
 
     impl SessionStore for FakeSessionStore {
-        fn save(&self, _session: &Session) -> anyhow::Result<()> {
+        fn save(&self, session: &Session) -> anyhow::Result<()> {
             let save_count: usize = self.save_count.get() + 1;
             self.save_count.set(save_count);
+            self.saved_statuses.borrow_mut().push(session.status);
             let should_fail: bool = match self.save_failure {
                 SaveFailure::Never => false,
                 SaveFailure::First => save_count == 1,
@@ -350,6 +384,7 @@ mod tests {
     struct FakeWorker {
         shutdown_calls: Rc<Cell<usize>>,
         fail_turn: bool,
+        timed_out_turn: bool,
         fail_shutdown: bool,
     }
 
@@ -358,8 +393,14 @@ mod tests {
             Self {
                 shutdown_calls,
                 fail_turn,
+                timed_out_turn: false,
                 fail_shutdown,
             }
+        }
+
+        fn with_timed_out_turn(mut self) -> Self {
+            self.timed_out_turn = true;
+            self
         }
 
         fn make_thread(&self) -> FakeWorkerThread {
@@ -367,6 +408,7 @@ mod tests {
                 thread_id: ThreadId("fake-thread".to_string()),
                 shutdown_calls: Rc::clone(&self.shutdown_calls),
                 fail_turn: self.fail_turn,
+                timed_out_turn: self.timed_out_turn,
                 fail_shutdown: self.fail_shutdown,
                 response: fake_response(),
             }
@@ -391,6 +433,7 @@ mod tests {
         thread_id: ThreadId,
         shutdown_calls: Rc<Cell<usize>>,
         fail_turn: bool,
+        timed_out_turn: bool,
         fail_shutdown: bool,
         response: WorkerResponse,
     }
@@ -401,6 +444,11 @@ mod tests {
         }
 
         fn turn(&mut self, _request: &WorkerRequest) -> anyhow::Result<WorkerResponse> {
+            if self.timed_out_turn {
+                return Err(anyhow::Error::new(TimedOut {
+                    timeout: Duration::from_secs(30 * 60),
+                }));
+            }
             if self.fail_turn {
                 anyhow::bail!("the fake worker failed the turn");
             }
@@ -424,6 +472,7 @@ mod tests {
             model: "fake-model".to_string(),
             effort: "medium".to_string(),
             mode: Mode::Inspect,
+            timeout: Duration::from_secs(30 * 60),
         }
     }
 
@@ -498,6 +547,26 @@ mod tests {
         let error: anyhow::Error = result.expect_err("delegate should return the turn error");
         let formatted_error: String = format!("{error:#}");
         assert!(formatted_error.contains("the fake worker failed the turn"));
+    }
+
+    #[test]
+    fn saves_a_timed_out_status_after_a_timed_out_turn() {
+        let shutdown_calls: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+        let worker: FakeWorker =
+            FakeWorker::new(Rc::clone(&shutdown_calls), false, false).with_timed_out_turn();
+        let store: FakeSessionStore = FakeSessionStore::new(SaveFailure::Never);
+        let request: WorkerRequest = fake_request();
+
+        let result: anyhow::Result<(SessionId, WorkerResponse)> =
+            delegate(&worker, &store, None, &request);
+
+        let error: anyhow::Error = result.expect_err("delegate should return the timeout error");
+        assert!(error.downcast_ref::<TimedOut>().is_some());
+        let saved_statuses: Vec<SessionStatus> = store.saved_statuses.borrow().clone();
+        assert_eq!(
+            saved_statuses,
+            vec![SessionStatus::Running, SessionStatus::TimedOut]
+        );
     }
 
     #[test]

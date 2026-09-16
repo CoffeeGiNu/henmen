@@ -34,13 +34,16 @@ impl RunLog for RunLogFile {
 mod tests {
     use super::*;
     use crate::delegation::application::{
-        Mode, RunKind, RunRecord, SessionStatus, TokenUsage, WorkerStatus,
+        Mode, RateLimitObservation, RateLimitWindow, RunKind, RunRecord, SessionStatus, TokenUsage,
+        WorkerStatus,
     };
 
     fn sample(
         session_id: &str,
         usage: Option<TokenUsage>,
         worker_status: Option<WorkerStatus>,
+        rate_limit_before: Option<RateLimitObservation>,
+        rate_limit_after: Option<RateLimitObservation>,
     ) -> RunRecord {
         RunRecord {
             timestamp_start: 1_757_894_400_000,
@@ -54,6 +57,8 @@ mod tests {
             session_status: SessionStatus::Completed,
             worker_status,
             usage,
+            rate_limit_before,
+            rate_limit_after,
             worker_startup_milliseconds: Some(340),
         }
     }
@@ -72,8 +77,32 @@ mod tests {
                 output_tokens: Some(30),
             }),
             Some(WorkerStatus::Done),
+            Some(RateLimitObservation {
+                limit_id: Some("codex-primary".to_string()),
+                primary: Some(RateLimitWindow {
+                    used_percent: 31.5,
+                    window_duration_minutes: Some(60),
+                    resets_at: Some(1_757_894_460),
+                }),
+                secondary: None,
+            }),
+            Some(RateLimitObservation {
+                limit_id: Some("codex-primary".to_string()),
+                primary: Some(RateLimitWindow {
+                    used_percent: 42.75,
+                    window_duration_minutes: Some(60),
+                    resets_at: Some(1_757_894_460),
+                }),
+                secondary: None,
+            }),
         ))?;
-        run_log.append(&sample("01K5CQXM8N7VZR3TFWJ0HB2YQE", None, None))?;
+        run_log.append(&sample(
+            "01K5CQXM8N7VZR3TFWJ0HB2YQE",
+            None,
+            None,
+            None,
+            None,
+        ))?;
 
         let contents: String = std::fs::read_to_string(&run_log.path)?;
         let lines: Vec<&str> = contents.lines().collect();
@@ -87,10 +116,14 @@ mod tests {
         assert_eq!(first["worker_status"], "done");
         assert_eq!(first["duration_ms"], 12_500);
         assert_eq!(first["usage"]["cached_input_tokens"], 64);
+        assert_eq!(first["rate_limit_before"]["primary"]["used_percent"], 31.5);
+        assert_eq!(first["rate_limit_after"]["primary"]["used_percent"], 42.75);
         assert_eq!(first["worker_startup_ms"], 340);
 
         let second: serde_json::Value = serde_json::from_str(lines[1])?;
         assert!(second.get("usage").is_none());
+        assert!(second.get("rate_limit_before").is_none());
+        assert!(second.get("rate_limit_after").is_none());
         assert_eq!(second.get("worker_status"), Some(&serde_json::Value::Null));
 
         std::fs::remove_dir_all(&root)?;
