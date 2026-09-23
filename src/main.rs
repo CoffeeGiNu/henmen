@@ -1,4 +1,3 @@
-// mod curation;
 mod delegation;
 mod termination;
 
@@ -57,7 +56,10 @@ struct TurnOptions {
         help = "Model slug for the worker. See `henmen models` for available choices"
     )]
     model: String,
-    #[arg(long, help = "Reasoning effort. See `henmen models` for supported values")]
+    #[arg(
+        long,
+        help = "Reasoning effort. See `henmen models` for supported values"
+    )]
     effort: String,
     #[arg(
         long,
