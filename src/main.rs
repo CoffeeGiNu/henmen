@@ -11,7 +11,7 @@ use crate::delegation::adapters::codex::CodexWorker;
 use crate::delegation::adapters::log::RunLogFile;
 use crate::delegation::adapters::session::SessionFiles;
 use crate::delegation::application::{
-    Mode, SessionId, TimedOut, WorkerRequest, WorkerResponse, delegate, resume,
+    Mode, SessionId, TimedOut, WorkerRequest, WorkerResponse, delegate, models, resume,
 };
 use crate::delegation::ports::{RunLog, SessionStore, Worker};
 use crate::termination::Termination;
@@ -30,6 +30,8 @@ struct CommandLineInterface {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(about = "Print available Codex models and reasoning efforts as JSON")]
+    Models,
     #[command(about = "Run one worker turn in a fresh thread")]
     Delegate {
         #[arg(help = "What the worker should do")]
@@ -154,6 +156,10 @@ fn main() -> anyhow::Result<()> {
     install_termination_handler(Arc::clone(&termination))?;
 
     let worker: CodexWorker = CodexWorker::new(termination);
+    if matches!(&command_line_interface.command, Command::Models) {
+        println!("{}", models(&worker)?);
+        return Ok(());
+    }
     let store: SessionFiles = SessionFiles::new(state_directory()?.join("sessions"));
     let run_log: Option<RunLogFile> = opt_in_run_log()?;
     let run_log: Option<&dyn RunLog> = run_log
@@ -162,6 +168,7 @@ fn main() -> anyhow::Result<()> {
 
     let turn_result: anyhow::Result<(SessionId, WorkerResponse)> =
         match command_line_interface.command {
+            Command::Models => unreachable!(),
             Command::Delegate { task, options } => {
                 run_delegate(&worker, &store, run_log, task, options)
             }

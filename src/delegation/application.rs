@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::delegation::ports::{RunLog, SessionStore, Worker, WorkerThread};
+use crate::delegation::ports::{ModelCatalog, RunLog, SessionStore, Worker, WorkerThread};
 
 #[derive(Debug, thiserror::Error)]
 #[error("the worker was interrupted")]
@@ -265,6 +265,10 @@ fn shutdown_after<T>(
     }
 }
 
+pub fn models(catalog: &dyn ModelCatalog) -> anyhow::Result<serde_json::Value> {
+    catalog.list_models()
+}
+
 pub fn delegate(
     worker: &dyn Worker,
     store: &dyn SessionStore,
@@ -463,6 +467,43 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    struct FakeModelCatalog {
+        response: Option<serde_json::Value>,
+    }
+
+    impl crate::delegation::ports::ModelCatalog for FakeModelCatalog {
+        fn list_models(&self) -> anyhow::Result<serde_json::Value> {
+            self.response
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("model listing failed"))
+        }
+    }
+
+    #[test]
+    fn models_returns_the_catalog_response_unchanged() {
+        let response = serde_json::json!({
+            "data": [{
+                "id": "test-model",
+                "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [{ "reasoningEffort": "low" }]
+            }],
+            "nextCursor": "next-page"
+        });
+        let catalog = FakeModelCatalog {
+            response: Some(response.clone()),
+        };
+
+        assert_eq!(models(&catalog).expect("models should succeed"), response);
+    }
+
+    #[test]
+    fn models_propagates_catalog_errors() {
+        let catalog = FakeModelCatalog { response: None };
+
+        let error = models(&catalog).expect_err("models should fail");
+        assert!(format!("{error:#}").contains("model listing failed"));
     }
 
     fn fake_request() -> WorkerRequest {

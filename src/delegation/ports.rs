@@ -2,6 +2,10 @@ use crate::delegation::application::{
     RunRecord, Session, SessionId, ThreadId, WorkerMetrics, WorkerRequest, WorkerResponse,
 };
 
+pub trait ModelCatalog {
+    fn list_models(&self) -> anyhow::Result<serde_json::Value>;
+}
+
 pub trait SessionStore {
     fn save(&self, session: &Session) -> anyhow::Result<()>;
     fn load(&self, id: &SessionId) -> anyhow::Result<Session>;

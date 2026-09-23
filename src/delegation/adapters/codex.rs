@@ -11,7 +11,7 @@ use crate::delegation::application::{
     Interrupted, Mode, RateLimitObservation, RateLimitWindow, ThreadId, TimedOut, TokenUsage,
     WorkerMetrics, WorkerRequest, WorkerResponse,
 };
-use crate::delegation::ports::{Worker, WorkerThread};
+use crate::delegation::ports::{ModelCatalog, Worker, WorkerThread};
 use crate::termination::Termination;
 
 pub struct CodexProcess {
@@ -246,6 +246,25 @@ impl CodexWorker {
                 error.context(combined)
             }
         }
+    }
+}
+
+impl ModelCatalog for CodexWorker {
+    fn list_models(&self) -> anyhow::Result<serde_json::Value> {
+        let mut process: CodexProcess = self.spawn_registered()?;
+        let response: serde_json::Value = match process.request(
+            "model/list",
+            serde_json::json!({}),
+            Some(Deadline::after(Duration::from_secs(10))),
+        ) {
+            Ok(response) => response,
+            Err(error) => return Err(self.shutdown_after_error(process, error)),
+        };
+
+        let shutdown: anyhow::Result<()> = process.shutdown();
+        self.termination.clear_child_process_id();
+        shutdown?;
+        Ok(response)
     }
 }
 
