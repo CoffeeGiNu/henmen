@@ -249,6 +249,7 @@ impl CodexWorker {
     }
 }
 
+// TODO: need nextCursor for model/list command for the future?
 impl ModelCatalog for CodexWorker {
     fn list_models(&self) -> anyhow::Result<serde_json::Value> {
         let mut process: CodexProcess = self.spawn_registered()?;
