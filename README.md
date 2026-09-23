@@ -1,6 +1,6 @@
 # henmen
 
-Delegate broad code investigation to a worker agent, so the calling agent's context stays small.
+Delegate code investigation and well-scoped edits to a worker agent, keeping the calling agent's context small.
 
 Supported backends: [Codex]
 
