@@ -1,6 +1,8 @@
 # henmen
 
-Delegate broad code investigation to a Codex worker, so the calling agent's context stays small.
+Delegate broad code investigation to a worker agent, so the calling agent's context stays small.
+
+Supported backends: [Codex]
 
 ## install
 
@@ -11,6 +13,7 @@ cargo install --path .
 ## usage
 
 ```bash
+henmen models
 henmen delegate <TASK> --model <MODEL> --effort <EFFORT> --mode <inspect|edit> [--cwd <PATH>] [--timeout-minutes <MINUTES>]
 henmen resume <SESSION_ID> <TASK> --model <MODEL> --effort <EFFORT> --mode <inspect|edit> [--cwd <PATH>] [--timeout-minutes <MINUTES>]
 ```

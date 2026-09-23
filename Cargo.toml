@@ -3,7 +3,7 @@ name = "henmen"
 version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Delegate broad code investigation to a Codex worker, so the calling agent's context stays small."
+description = "Delegate broad code investigation to a worker agent, so the calling agent's context stays small."
 repository = "https://github.com/CoffeeGiNu/henmen"
 readme = "README.md"
 

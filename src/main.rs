@@ -20,8 +20,8 @@ use crate::termination::Termination;
 #[command(
     name = "henmen",
     version,
-    about = "Delegate broad code investigation to a worker agent, so the calling agent's context stays small. The worker currently runs on [Codex]",
-    after_long_help = "Each run prints one JSON object on stdout, and nothing else; diagnostics go to stderr.\n\n  {\"session_id\": \"01M2HZ...\",\n   \"response\": {\"status\": \"done\"|\"blocked\",\n                \"summary\": \"...\",\n                \"evidence\": [\"src/retry.rs:120-145\"],\n                \"changed_files\": [],\n                \"tests\": [],\n                \"open_questions\": []}}\n\nPass that session_id to `henmen resume` to continue the same thread. A read-only\nworker that could not do what it was asked reports \"blocked\" rather than failing.\n\nSessions are stored under $XDG_STATE_HOME/henmen/sessions/, or\n~/.local/state/henmen/sessions/ when that is unset."
+    about = "Delegate broad code investigation to a worker agent, so the calling agent's context stays small.",
+    after_long_help = "Each command prints JSON on stdout, and nothing else; diagnostics go to stderr.\n`models` returns the current backend's available models and effort options.\n`delegate` and `resume` return:\n\n  {\"session_id\": \"01M2HZ...\",\n   \"response\": {\"status\": \"done\"|\"blocked\",\n                \"summary\": \"...\",\n                \"evidence\": [\"src/retry.rs:120-145\"],\n                \"changed_files\": [],\n                \"tests\": [],\n                \"open_questions\": []}}\n\nPass that session_id to `henmen resume` to continue the same thread. A read-only\nworker that could not do what it was asked reports \"blocked\" rather than failing.\n\nSessions are stored under $XDG_STATE_HOME/henmen/sessions/, or\n~/.local/state/henmen/sessions/ when that is unset."
 )]
 struct CommandLineInterface {
     #[command(subcommand)]
@@ -30,7 +30,7 @@ struct CommandLineInterface {
 
 #[derive(Subcommand)]
 enum Command {
-    #[command(about = "Print available Codex models and reasoning efforts as JSON")]
+    #[command(about = "Print available models and effort options from the current backend as JSON")]
     Models,
     #[command(about = "Run one worker turn in a fresh thread")]
     Delegate {
@@ -54,10 +54,10 @@ enum Command {
 struct TurnOptions {
     #[arg(
         long,
-        help = "Model slug for the worker. Which slugs exist is decided by the backend, not by henmen"
+        help = "Model slug for the worker. See `henmen models` for available choices"
     )]
     model: String,
-    #[arg(long, help = "Reasoning effort. Valid values depend on the model")]
+    #[arg(long, help = "Reasoning effort. See `henmen models` for supported values")]
     effort: String,
     #[arg(
         long,
